@@ -35,7 +35,9 @@ static int throtl_quantum = 32;
 #define INIT_CREDIT 15000
 #define CRD_UPDATE_TIME (HZ / 2)
 #define CRD_DIST_TIME (HZ / 10)
-#define MORE_CRD_RST_TIME (HZ / 50)
+#define JIFFIES_MS (HZ / 1000)
+#define MS_IN_JIFFIES(x) (x * JIFFIES_MS)
+
 /*
  * For HD, very small latency comes from sequential IO. Such IO is helpless to
  * help determine if its IO is impacted by others, hence we ignore the IO
@@ -137,17 +139,16 @@ enum {
 };
 
 struct cpm_data {
-	unsigned int cpm[2];
-	int s[2];
+	unsigned long cpm[2];
+	unsigned int s[2];
 	unsigned int track[2];
 	unsigned long upd_time;
+	bool under_predict;
 };
 
 struct credit_state {
 	unsigned int credit[3];
-	unsigned int nr_crd[2];
 	bool throttle;
-	u64 time_elapsed;
 	u64 last_dist_time;
 	unsigned long dist_time;
 };
@@ -285,15 +286,10 @@ struct throtl_data
 	/* Add members for credit distribution */
 	bool more_crd;
 	unsigned int max_weight_credit;
-	unsigned int nr_crd[2];
-	unsigned long nr_crd_rst;
 	struct throtl_grp *tg[2];
-	struct timer_list reset_timer;
 };
 
 static void throtl_pending_timer_fn(struct timer_list *t);
-
-static void throtl_reset_timer_fn(struct timer_list *t);
 
 static inline struct credit_data *cpd_to_crd(struct blkcg_policy_data *cpd)
 {
@@ -574,7 +570,7 @@ static struct blkcg_policy_data *tg_cpd_alloc(gfp_t gfp)
 static void tg_cpd_init(struct blkcg_policy_data *cpd)
 {
 	struct credit_data *crd = cpd_to_crd(cpd);
-	crd->weight = 0;
+	memset(crd, 0, sizeof(*crd));
 }
 
 static void tg_cpd_free(struct blkcg_policy_data *cpd)
@@ -648,14 +644,6 @@ static void throtl_pd_init(struct blkg_policy_data *pd)
 	tg->td = td;
 	tg->weight = crd->weight;
 	tg->crd = crd;
-#if 0
-	/*
-	 * It the id is 2, it means that blkcg other than the root is created.
-	 * Therefore, start the reset_timer that calcaulted the GC contribution.
-	 */
-	if (id == 2)
-		mod_timer(&td->reset_timer, jiffies + HZ * 5);
-#endif
 }
 
 /*
@@ -716,7 +704,7 @@ static void throtl_pd_online(struct blkg_policy_data *pd)
 	if (td->more_crd)
 		td->more_crd = false;
 
-	if (td->max_weight_credit != INIT_CREDIT)
+	if (!td->max_weight_credit)
 		tg->td->max_weight_credit = INIT_CREDIT;
 
 	tg_update_has_rules(tg);
@@ -747,13 +735,6 @@ static void throtl_upgrade_state(struct throtl_data *td);
 static void throtl_pd_offline(struct blkg_policy_data *pd)
 {
 	struct throtl_grp *tg = pd_to_tg(pd);
-#if 0
-	struct blkcg_gq *blkg = tg_to_blkg(tg);
-	unsigned int id = blkg->blkcg->css.id;
-
-	if (id == 2)
-		del_timer_sync(&tg->td->reset_timer);
-#endif
 
 	tg->bps[READ][LIMIT_LOW] = 0;
 	tg->bps[WRITE][LIMIT_LOW] = 0;
@@ -1075,58 +1056,46 @@ static bool tg_with_in_iops_limit(struct throtl_grp *tg, struct bio *bio,
 	return false;
 }
 
-static inline void throtl_predict_crd(struct throtl_grp *tg)
+static inline void throtl_predict_crd(struct throtl_grp *tg, unsigned long now)
 {
 	struct throtl_data *td = tg->td;
 	struct cpm_data *cpmd = &tg->crd->cpmd;
 	struct credit_state *crs = &tg->crd->crs;
 	int a = 0, b = 0, s[2], alpha;
-	int diff, error;
+	int diff;
 
-	if (cpmd->cpm[ACT]) {
-		cpmd->cpm[SUM] += cpmd->cpm[ACT];
-		cpmd->cpm[ACT] = 0;
+	if (!cpmd->s[0] || !cpmd->s[1])
+		cpmd->s[0] = cpmd->s[1] = cpmd->cpm[SUM];
+
+	diff = td->max_weight_credit * cpmd->track[CNT] - cpmd->track[CRD];
+
+	if (diff < 0)
+		diff *= -1;
+
+	if (diff < 1024) /* < 1MB/s */
+		alpha = 10;
+	else if (1024 <= diff && diff < 2048)
+		alpha = 30;
+	else             /* > 2MB/s */
+		alpha = 70;
+
+	s[0] = cpmd->cpm[SUM] * alpha / 100 + cpmd->s[0] * (100 - alpha) / 100;
+	s[1] = s[0]           * alpha / 100 + cpmd->s[1] * (100 - alpha) / 100;
+
+	cpmd->s[0] = s[0];
+	cpmd->s[1] = s[1];
+
+	a = 2*s[0] - s[1];
+	b = alpha * 100 / (100 - alpha) * (s[0] - s[1]) / 100;
+
+	if (tg == td->tg[MAX]) {
+		td->max_weight_credit = (a + b) * 5;
+		td->max_weight_credit *= (2 - !cpmd->under_predict);
 	}
 
-	if (time_after(jiffies, cpmd->upd_time)) {
-		if (!cpmd->s[0] || !cpmd->s[1]) {
-			cpmd->s[0] = cpmd->cpm[SUM];
-			cpmd->s[1] = cpmd->cpm[SUM];
-		}
-
-		diff = (td->max_weight_credit * cpmd->track[CNT]) - cpmd->track[CRD];
-
-		if (diff < 0)
-			diff *= -1;
-
-		error = (diff * 100000) /  cpmd->track[CRD];
-
-		if (error < 10)
-			alpha = 10;
-		else if (10 <= error && error < 100)
-			alpha = 30;
-		else
-			alpha = 70;
-
-		s[0] = ((cpmd->cpm[SUM] * alpha) / 100)
-			+ ((cpmd->s[0] * (100 - alpha)) / 100);
-		s[1] = ((s[0] * alpha) / 100)
-			+ ((cpmd->s[1] * (100 - alpha)) / 100);
-
-		cpmd->s[0] = s[0];
-		cpmd->s[1] = s[1];
-
-		a = 2*s[0] - s[1];
-		b = (((alpha * 100) / (100 - alpha))
-				* (s[0] - s[1])) / 100;
-
-		if (tg == td->tg[MAX])
-			td->max_weight_credit = (a + b) * 5;
-
-		crs->credit[RESD] = cpmd->cpm[SUM] = 0;
-		cpmd->track[CRD] = cpmd->track[CNT] = 0;
-		cpmd->upd_time = jiffies + CRD_UPDATE_TIME;
-	}
+	crs->credit[RESD] = cpmd->cpm[SUM] = 0;
+	cpmd->track[CRD] = cpmd->track[CNT] = 0;
+	cpmd->upd_time = now + CRD_UPDATE_TIME;
 }
 
 static inline void throtl_dist_crd(struct throtl_grp *tg) {
@@ -1134,44 +1103,50 @@ static inline void throtl_dist_crd(struct throtl_grp *tg) {
 	struct credit_state *crs = &tg->crd->crs;
 	struct cpm_data *cpmd = &tg->crd->cpmd;
 	unsigned int w_ratio = td->tg[MAX]->weight / tg->weight;
+	unsigned long time_elapsed;
+	unsigned long now = jiffies;
+	unsigned int remain = crs->credit[CUR] + crs->credit[RESD];
 
 	if (!cpmd->upd_time) {
-		cpmd->upd_time = jiffies + CRD_UPDATE_TIME;
+		cpmd->upd_time = now + CRD_UPDATE_TIME;
 		goto dist;
 	}
 
-	if (crs->credit[USED]) {
-		if (!crs->throttle) {
-			crs->time_elapsed = jiffies_to_nsecs(jiffies) - crs->last_dist_time;
-			crs->time_elapsed /= NSEC_PER_MSEC;
-			cpmd->cpm[ACT] = crs->credit[USED] / crs->time_elapsed;
-		}
+	if (!crs->throttle) {
+		time_elapsed = MS_IN_JIFFIES(now - crs->last_dist_time);
+		if (!time_elapsed)
+			time_elapsed = 1;
 
-		if (crs->credit[CUR] + crs->credit[RESD] > crs->credit[USED])
-			crs->credit[RESD]= crs->credit[CUR] + crs->credit[RESD] - crs->credit[USED];
-		else
-			crs->credit[RESD] = 0;
-
-		cpmd->track[CRD] += crs->credit[USED];
-
-		if (cpmd->cpm[ACT]) 
-			throtl_predict_crd(tg);
+		cpmd->cpm[ACT] = crs->credit[USED] / time_elapsed;
+		cpmd->under_predict = !cpmd->cpm[ACT] ? true : false;
 	}
+	cpmd->cpm[SUM] += cpmd->cpm[ACT];
+	cpmd->cpm[ACT] = 0;
 
+	cpmd->track[CRD] += crs->credit[USED];
+	cpmd->track[CNT]++;
+
+	if (remain > crs->credit[USED])
+		crs->credit[RESD] = remain - crs->credit[USED];
+	else
+		crs->credit[RESD] = 0;
+
+	if (time_after(now, cpmd->upd_time))
+		throtl_predict_crd(tg, now);
 dist:
 	crs->throttle = false;
 	crs->credit[CUR] = td->max_weight_credit / w_ratio;
-	crs->credit[USED] =	crs->time_elapsed = 0;
-	cpmd->track[CNT]++;
-	crs->dist_time = jiffies + CRD_DIST_TIME;
-	crs->last_dist_time = jiffies_to_nsecs(jiffies);
+	crs->credit[USED] = 0;
+
+	crs->dist_time = now + CRD_DIST_TIME;
+	crs->last_dist_time = now;
 }
 
-static void throtl_state_check(struct throtl_data *td)
+static void throtl_state_check(struct throtl_data *td, unsigned long now)
 {
 	struct cgroup_subsys_state *pos_css;
 	struct blkcg_gq *blkg;
-	u32 tg_active = 0, tg_idle = 0;
+	u32 tg_active = 0, tg_throttle = 0;
 
 	rcu_read_lock();
 	blkg_for_each_descendant_post(blkg, pos_css, td->queue->root_blkg) {
@@ -1179,41 +1154,36 @@ static void throtl_state_check(struct throtl_data *td)
 
 		if (!crd->weight)
 			continue;
-		tg_active++;
-		if (time_after(jiffies, crd->crs.dist_time))
-			continue;
-		if (!crd->crs.credit[USED])
-			continue;
-		if (!crd->crs.throttle)
-			continue;
-		tg_idle++;
+
+		if (time_before(now, crd->crs.dist_time))
+			tg_active++;
+		if (crd->crs.throttle)
+			tg_throttle++;
 	}
 	rcu_read_unlock();
 
-	if ((tg_active && tg_idle) && tg_active == tg_idle)
+	if (tg_active == tg_throttle)
 		td->more_crd = true;	
 	else
 		td->more_crd = false;
 }
 
-static inline void tg_elapsed_time_check(struct throtl_grp *tg) {
+static inline void tg_elapsed_time_check(struct throtl_grp *tg, unsigned long now) {
 	struct credit_state *crs = &tg->crd->crs;
 	struct cpm_data *cpmd = &tg->crd->cpmd;
-	u64 time_elapsed = 0;
-	unsigned int cpm = 0;
+	unsigned long time_elapsed;
 
 	/* Calculate CPM by dividing the amount of credit used */
-	time_elapsed = jiffies_to_nsecs(jiffies) - crs->last_dist_time;
-	time_elapsed /= NSEC_PER_MSEC;
-	cpm = crs->credit[USED];
+	time_elapsed = MS_IN_JIFFIES(jiffies - crs->last_dist_time);
+	if (!time_elapsed)
+		time_elapsed = 1;
 
-	if (time_elapsed > 0 && cpm > 0)
-		do_div(cpm, time_elapsed);
+	cpmd->cpm[ACT] = crs->credit[USED] / time_elapsed;
+	cpmd->under_predict = !cpmd->cpm[ACT] ? true : false;
 
-	cpmd->cpm[ACT] = cpm;
 	crs->throttle = true;
 
-	throtl_state_check(tg->td);
+	throtl_state_check(tg->td, now);
 }
 
 static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
@@ -1221,16 +1191,17 @@ static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
 	struct credit_state *crs = &tg->crd->crs;
 	unsigned int bio_size = throtl_bio_data_size(bio);
 	unsigned int CPB = bio_size / 512;
-	bool time_out = false;
+	unsigned long now = jiffies;
+	bool time_out;
 
 again:
-	if (time_before(jiffies, crs->dist_time)) {
-		if (crs->credit[CUR] + crs->credit[RESD] - crs->credit[USED] >= CPB) {
+	time_out = false;
+	if (time_before(now, crs->dist_time)) {
+		if (crs->credit[CUR] + crs->credit[RESD] > crs->credit[USED]) {
 			crs->credit[USED] += CPB;
-			//bio->bi_issue.CPB[rw] = CPB;
 			return true;
 		} else if (!crs->throttle)
-			tg_elapsed_time_check(tg);
+			tg_elapsed_time_check(tg, now);
 	} else
 		time_out = true;
 
@@ -1542,37 +1513,6 @@ static int throtl_select_dispatch(struct throtl_service_queue *parent_sq)
 
 static bool throtl_can_upgrade(struct throtl_data *td,
 		struct throtl_grp *this_tg);
-
-static void throtl_reset_timer_fn(struct timer_list *t)
-{
-	struct throtl_data *td = from_timer(td, t, reset_timer);
-	struct cgroup_subsys_state *pos_css;
-	struct blkcg_gq *blkg;
-
-	if (td->nr_crd[R])
-		td->nr_crd[R] /= 2;
-
-	if (td->nr_crd[W])
-		td->nr_crd[W] /= 2;
-
-	rcu_read_lock();
-	blkg_for_each_descendant_post(blkg, pos_css, td->queue->root_blkg) {
-		struct credit_data *crd = blkg_to_tg(blkg)->crd;
-		struct credit_state *crs = &crd->crs;
-
-		if (!crd->weight)
-			continue;
-
-		if (crs->nr_crd[R])
-			crs->nr_crd[R] /= 2;
-
-		if (crs->nr_crd[W])
-			crs->nr_crd[W] /= 2;
-	}
-	rcu_read_unlock();
-
-	mod_timer(&td->reset_timer, jiffies + HZ);
-}
 
 /**
  * throtl_pending_timer_fn - timer function for service_queue->pending_timer
@@ -2723,37 +2663,6 @@ void blk_throtl_bio_endio(struct bio *bio)
 		tg->bad_bio_cnt /= 2;
 	}
 }
-#else
-void throtl_bio_crd_check(struct bio *bio)
-{
-#if 0
-	struct blkcg_gq *blkg= bio->bi_blkg;
-	struct throtl_grp *tg;
-	struct throtl_data *td;
-	struct credit_state *crs;
-	u64 finish_time_ns;
-	int rw = bio_data_dir(bio);
-	unsigned int CPB = bio->bi_issue.CPB[rw];
-	unsigned long finish_time, start_time;
-
-	if (!blkg || !blkg->blkcg->weight)
-		return;
-
-	tg = blkg_to_tg(blkg);
-	td = tg->td;
-	crs = &tg->crd->crs;
-
-	finish_time_ns = ktime_get_ns();
-	start_time = bio_issue_time(&bio->bi_issue) >> 10;
-	finish_time = __bio_issue_time(finish_time_ns) >> 10;
-
-	if (!start_time || finish_time <= start_time)
-		return;
-
-	td->nr_crd[rw] += CPB;
-	crs->nr_crd[rw] += CPB;
-#endif
-}
 #endif
 
 /*
@@ -2846,8 +2755,6 @@ int blk_throtl_init(struct request_queue *q)
 
 	q->td = td;
 	td->queue = q;
-
-	timer_setup(&td->reset_timer, throtl_reset_timer_fn, 0);
 
 	td->limit_valid[LIMIT_MAX] = true;
 	td->limit_index = LIMIT_MAX;
