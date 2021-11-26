@@ -1141,7 +1141,7 @@ static inline void throtl_dist_crd(struct throtl_grp *tg, unsigned long now) {
 	else
 		crs->credit[RESD] = 0;
 
-	if (time_after(now, cpmd->upd_time));
+	if (time_after(now, cpmd->upd_time))
 		throtl_predict_crd(tg, now);
 dist:
 	crs->throttle = false;
